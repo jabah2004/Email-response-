@@ -1,0 +1,276 @@
+"""
+Keyword-based Email Auto-Responder
+-----------------------------------
+Reads unread emails from an inbox (IMAP), checks the subject/body against a
+set of keyword rules, and sends an automatic reply (SMTP) based on the first
+matching rule. Designed to run once per invocation — schedule it with cron,
+Windows Task Scheduler, or a simple while-loop + sleep if you want it running
+continuously.
+
+SETUP
+1. pip install --break-system-packages python-dotenv   (optional, for .env)
+2. Fill in the CONFIG section below (or use environment variables).
+3. If using Gmail: enable IMAP in Gmail settings, and use an "App Password"
+   (Google Account -> Security -> App Passwords) instead of your real password
+   if 2FA is on (it usually is, and plain passwords won't work anyway).
+4. Edit KEYWORD_RULES to match your use case.
+5. Run: python email_autoresponder.py
+
+HOW MATCHING WORKS
+- Rules are checked top to bottom; the first rule whose keywords are found
+  (in subject OR body, case-insensitive) wins and its reply is sent.
+- A rule matches if ANY of its keywords appear (OR logic). If you want AND
+  logic for a rule, list keyword tuples instead — see the "refund + urgent"
+  example.
+- Emails that match no rule are left alone (marked read, or optionally
+  flagged for manual review — see NO_MATCH_ACTION).
+"""
+
+import imaplib
+import smtplib
+import email
+import os
+import time
+import logging
+from email.header import decode_header
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ============================================================
+# CONFIG — edit these
+# ============================================================
+
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "your_email@gmail.com")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "your_app_password")
+
+MAILBOX = "INBOX"
+CHECK_INTERVAL_SECONDS = 60      # only used in --loop mode
+NO_MATCH_ACTION = "ignore"       # "ignore" | "flag" (adds a star/flag, no reply)
+MARK_AS_READ_AFTER_PROCESSING = True
+
+# Each rule: keywords (list[str] = OR match, list[tuple] = AND match within
+# the tuple), subject, and body template. {sender_name} and {original_subject}
+# are available as placeholders in the body.
+KEYWORD_RULES = [
+    {
+        "name": "greeting_general",
+        "keywords": ["hello", "hi", "good morning", "inquiry", "information", "help", "assistance"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "Hello! Thanks for reaching out. How can I help you today? "
+            "Please let us know if you need support, pricing, or order status."
+        ),
+    },
+    {
+        "name": "support_complaint",
+        "keywords": ["not working", "error", "issue", "problem", "broken", "can't login", "failed", "complaint", "urgent"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "Sorry for the inconvenience. Our support team has received your message. "
+            "Could you please share your order ID / screenshot? We'll respond within 2 hours."
+        ),
+    },
+    {
+        "name": "order_status_tracking",
+        "keywords": ["order status", "where is my order", "tracking", "delivery", "shipped", "delay", "tracking number"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "Your order is being processed. Please provide your order number and email address "
+            "so we can check the tracking details for you."
+        ),
+    },
+    {
+        "name": "sales_pricing",
+        "keywords": ["price", "pricing", "cost", "quote", "discount", "how much", "buy", "purchase", "payment"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "Thanks for your interest! Could you let us know which product/service you are "
+            "interested in? I will send you the pricing and best offer."
+        ),
+    },
+    {
+        "name": "refund_cancellation",
+        "keywords": ["refund", "cancel", "return", "money back", "cancel order", "charge"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "We understand. Please provide your order number and reason for refund/cancellation, "
+            "and our billing team will review it within 24 hours."
+        ),
+    },
+    {
+        "name": "human_agent_escalation",
+        "keywords": ["human", "agent", "speak to someone", "manager", "call me", "not a bot"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "Got it. I'm connecting you to a human agent. Please stay online, someone will join shortly."
+        ),
+    },
+    {
+        "name": "thank_you_closing",
+        "keywords": ["thanks", "thank you", "appreciated", "great", "solved"],
+        "reply_subject": "Re: {original_subject}",
+        "reply_body": (
+            "You're welcome! Glad I could help. If you need anything else, just reply to this email."
+        ),
+    },
+]
+
+# Sent when no rule above matches (category 8: spam / out of scope).
+FALLBACK_REPLY = {
+    "name": "fallback_out_of_scope",
+    "reply_subject": "Re: {original_subject}",
+    "reply_body": (
+        "Thank you for your email. We've received it and our team will review "
+        "and get back to you within 24 hours."
+    ),
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("autoresponder")
+
+
+# ============================================================
+# CORE LOGIC — usually no need to edit below this line
+# ============================================================
+
+def decode_mime_str(s):
+    if not s:
+        return ""
+    parts = decode_header(s)
+    decoded = ""
+    for text, charset in parts:
+        if isinstance(text, bytes):
+            decoded += text.decode(charset or "utf-8", errors="ignore")
+        else:
+            decoded += text
+    return decoded
+
+
+def get_email_body(msg):
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "")
+            if ctype == "text/plain" and "attachment" not in disp:
+                charset = part.get_content_charset() or "utf-8"
+                body += part.get_payload(decode=True).decode(charset, errors="ignore")
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        body = msg.get_payload(decode=True).decode(charset, errors="ignore")
+    return body
+
+
+def rule_matches(rule, text_lower):
+    for kw in rule["keywords"]:
+        if isinstance(kw, tuple):
+            if all(k.lower() in text_lower for k in kw):
+                return True
+        else:
+            if kw.lower() in text_lower:
+                return True
+    return False
+
+
+def find_matching_rule(subject, body):
+    text_lower = (subject + " " + body).lower()
+    for rule in KEYWORD_RULES:
+        if rule_matches(rule, text_lower):
+            return rule
+    return None
+
+
+def send_reply(to_address, sender_name, original_subject, rule):
+    reply_subject = rule["reply_subject"].format(
+        original_subject=original_subject, sender_name=sender_name
+    )
+    reply_body = rule["reply_body"].format(
+        original_subject=original_subject, sender_name=sender_name
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to_address
+    msg["Subject"] = reply_subject
+    msg.attach(MIMEText(reply_body, "plain"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.send_message(msg)
+
+    log.info(f"Replied to {to_address} using rule '{rule['name']}'")
+
+
+def process_inbox():
+    imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    imap.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+    imap.select(MAILBOX)
+
+    status, message_ids = imap.search(None, "UNSEEN")
+    if status != "OK":
+        log.warning("Could not search mailbox")
+        imap.logout()
+        return
+
+    ids = message_ids[0].split()
+    log.info(f"Found {len(ids)} unread email(s)")
+
+    for msg_id in ids:
+        status, msg_data = imap.fetch(msg_id, "(RFC822)")
+        if status != "OK":
+            continue
+
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        subject = decode_mime_str(msg.get("Subject"))
+        from_header = decode_mime_str(msg.get("From"))
+        sender_email = email.utils.parseaddr(from_header)[1]
+        sender_name = email.utils.parseaddr(from_header)[0] or sender_email
+
+        body = get_email_body(msg)
+
+        rule = find_matching_rule(subject, body)
+
+        if rule:
+            try:
+                send_reply(sender_email, sender_name, subject, rule)
+            except Exception as e:
+                log.error(f"Failed to send reply to {sender_email}: {e}")
+        else:
+            log.info(f"No rule matched for email from {sender_email} (subject: {subject!r}) — sending fallback reply")
+            try:
+                send_reply(sender_email, sender_name, subject, FALLBACK_REPLY)
+            except Exception as e:
+                log.error(f"Failed to send fallback reply to {sender_email}: {e}")
+            if NO_MATCH_ACTION == "flag":
+                imap.store(msg_id, "+FLAGS", "\\Flagged")
+
+        if MARK_AS_READ_AFTER_PROCESSING:
+            imap.store(msg_id, "+FLAGS", "\\Seen")
+
+    imap.logout()
+
+
+def main(loop=False):
+    if loop:
+        log.info(f"Starting continuous mode, checking every {CHECK_INTERVAL_SECONDS}s")
+        while True:
+            try:
+                process_inbox()
+            except Exception as e:
+                log.error(f"Error during processing: {e}")
+            time.sleep(CHECK_INTERVAL_SECONDS)
+    else:
+        process_inbox()
+
+
+if __name__ == "__main__":
+    import sys
+    main(loop="--loop" in sys.argv)
